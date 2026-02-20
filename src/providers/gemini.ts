@@ -1,392 +1,395 @@
+import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { readFile, readdir } from "node:fs/promises";
 import type { Provider, QueryResult } from "../types";
 import { fetchWithTimeout } from "../utils/http";
 
-interface GoogleQuotaResponse {
-  models: Record<
-    string,
-    {
-      quotaInfo?: {
-        remainingFraction?: number;
-        resetTime?: string;
-      };
-    }
-  >;
+interface GeminiSettings {
+  authType?: string;
+  security?: {
+    auth?: {
+      selectedType?: string;
+    };
+  };
 }
 
-interface GeminiOauthCreds {
+interface GeminiOAuthCreds {
   access_token?: string;
   refresh_token?: string;
+  id_token?: string;
   expiry_date?: number;
-  scope?: string;
-  token_type?: string;
 }
 
-interface GeminiAccounts {
-  active?: string;
-  old?: string[];
+interface GeminiModelQuota {
+  percentLeft: number;
+  resetsIn: string;
+  modelId: string;
 }
 
-interface GeminiSettings {
-  security?: {
-    auth?: unknown;
-  };
-  mcpServers?: Record<string, unknown>;
+interface RetrieveUserQuotaResponse {
+  buckets?: Array<{
+    remainingFraction: number;
+    resetTime: string;
+    modelId: string;
+  }>;
 }
 
-interface GeminiState {
-  tipsShown?: number;
-}
+const GEMINI_DIR = path.join(os.homedir(), ".gemini");
+const SETTINGS_PATH = path.join(GEMINI_DIR, "settings.json");
+const OAUTH_CREDS_PATH = path.join(GEMINI_DIR, "oauth_creds.json");
 
-interface GeminiChatMessage {
-  model?: string;
-}
+const QUOTA_API = "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota";
+const LOAD_CODE_ASSIST_API = "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist";
+const TOKEN_REFRESH_API = "https://oauth2.googleapis.com/token";
+const PROJECTS_API = "https://cloudresourcemanager.googleapis.com/v1/projects";
 
-interface GeminiChatSession {
-  sessionId?: string;
-  projectHash?: string;
-  startTime?: string;
-  lastUpdated?: string;
-  messages?: GeminiChatMessage[];
-}
+const GEMINI_OAUTH2_RELATIVE_PATH = path.join(
+  "node_modules",
+  "@google",
+  "gemini-cli-core",
+  "dist",
+  "src",
+  "code_assist",
+  "oauth2.js",
+);
 
-interface ModelQuota {
-  displayName: string;
-  remainPercent: number;
-  resetTimeDisplay: string;
-}
-
-interface ModelConfig {
-  key: string;
-  altKey?: string;
-  display: string;
-}
-
-const GOOGLE_QUOTA_API_URL =
-  "https://cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels";
-const GOOGLE_TOKEN_REFRESH_URL = "https://oauth2.googleapis.com/token";
-const USER_AGENT = "antigravity/1.11.9 windows/amd64";
-const HIGH_USAGE_THRESHOLD = 90;
-
-const GOOGLE_CLIENT_ID =
-  "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com";
-const GOOGLE_CLIENT_SECRET = "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";
-
-const MODELS_TO_DISPLAY: ModelConfig[] = [
-  { key: "gemini-3-pro-high", altKey: "gemini-3-pro-low", display: "G3 Pro" },
-  { key: "gemini-3-pro-image", display: "G3 Image" },
-  { key: "gemini-3-flash", display: "G3 Flash" },
-  {
-    key: "claude-opus-4-5-thinking",
-    altKey: "claude-opus-4-5",
-    display: "Claude",
-  },
-];
-
-function geminiDir(): string {
-  return path.join(os.homedir(), ".gemini");
-}
-
-function geminiOauthPath(): string {
-  return path.join(geminiDir(), "oauth_creds.json");
-}
-
-function geminiAccountsPath(): string {
-  return path.join(geminiDir(), "google_accounts.json");
-}
-
-function geminiInstallationIdPath(): string {
-  return path.join(geminiDir(), "installation_id");
-}
-
-function geminiSettingsPath(): string {
-  return path.join(geminiDir(), "settings.json");
-}
-
-function geminiStatePath(): string {
-  return path.join(geminiDir(), "state.json");
-}
-
-function geminiTrustedFoldersPath(): string {
-  return path.join(geminiDir(), "trustedFolders.json");
-}
-
-function geminiTmpPath(): string {
-  return path.join(geminiDir(), "tmp");
-}
-
-function resolveProjectId(): string | null {
-  return (
-    process.env.GEMINI_PROJECT_ID?.trim() ||
-    process.env.GOOGLE_CLOUD_PROJECT?.trim() ||
-    process.env.GCLOUD_PROJECT?.trim() ||
-    null
-  );
-}
-
-async function readJsonIfExists<T>(filePath: string): Promise<T | null> {
+function readJsonFile<T>(filePath: string): T | null {
   try {
-    const content = await readFile(filePath, "utf8");
+    if (!fs.existsSync(filePath)) return null;
+    const content = fs.readFileSync(filePath, "utf-8");
     return JSON.parse(content) as T;
   } catch {
     return null;
   }
 }
 
-async function readTextIfExists(filePath: string): Promise<string | null> {
+function writeJsonFile<T>(filePath: string, data: T): void {
   try {
-    return (await readFile(filePath, "utf8")).trim() || null;
+    fs.writeFileSync(filePath, JSON.stringify(data, null, 2), "utf-8");
+  } catch {
+    // Ignore write errors.
+  }
+}
+
+function cleanString(value: string | undefined): string | null {
+  const trimmed = value?.trim();
+  return trimmed ? trimmed : null;
+}
+
+function resolveGeminiAuthType(settings: GeminiSettings | null): string {
+  return cleanString(settings?.authType) ?? cleanString(settings?.security?.auth?.selectedType) ?? "oauth-personal";
+}
+
+function resolveGeminiBinaryPath(): string | null {
+  for (const envKey of ["GEMINI_PATH", "GEMINI_CLI_PATH"]) {
+    const fromEnv = cleanString(process.env[envKey]);
+    if (fromEnv && fs.existsSync(fromEnv)) {
+      return fromEnv;
+    }
+  }
+
+  const pathEnv = cleanString(process.env.PATH);
+  if (pathEnv) {
+    for (const dir of pathEnv.split(path.delimiter)) {
+      const candidate = path.join(dir, "gemini");
+      if (fs.existsSync(candidate)) return candidate;
+    }
+  }
+
+  const commonCandidates = [
+    path.join(os.homedir(), ".local", "bin", "gemini"),
+    "/opt/homebrew/bin/gemini",
+    "/usr/local/bin/gemini",
+    "/usr/bin/gemini",
+  ];
+  for (const candidate of commonCandidates) {
+    if (fs.existsSync(candidate)) return candidate;
+  }
+  return null;
+}
+
+function findGeminiOauth2FilePath(binaryPath: string): string | null {
+  try {
+    const realPath = fs.realpathSync(binaryPath);
+    let currentDir = path.dirname(realPath);
+
+    for (let i = 0; i < 8; i += 1) {
+      const directCorePath = path.join(currentDir, GEMINI_OAUTH2_RELATIVE_PATH);
+      if (fs.existsSync(directCorePath)) return directCorePath;
+
+      const nestedCliPath = path.join(currentDir, "@google", "gemini-cli", GEMINI_OAUTH2_RELATIVE_PATH);
+      if (fs.existsSync(nestedCliPath)) return nestedCliPath;
+
+      const homebrewPath = path.join(
+        currentDir,
+        "libexec",
+        "lib",
+        "node_modules",
+        "@google",
+        "gemini-cli",
+        GEMINI_OAUTH2_RELATIVE_PATH,
+      );
+      if (fs.existsSync(homebrewPath)) return homebrewPath;
+
+      const parentDir = path.dirname(currentDir);
+      if (parentDir === currentDir) break;
+      currentDir = parentDir;
+    }
+  } catch {
+    // Ignore and fallback to env credentials.
+  }
+  return null;
+}
+
+function resolveGeminiOAuthClientCredentials(): { clientId: string; clientSecret: string } | null {
+  const envClientId = cleanString(process.env.GEMINI_OAUTH_CLIENT_ID);
+  const envClientSecret = cleanString(process.env.GEMINI_OAUTH_CLIENT_SECRET);
+  if (envClientId && envClientSecret) {
+    return { clientId: envClientId, clientSecret: envClientSecret };
+  }
+
+  const binaryPath = resolveGeminiBinaryPath();
+  if (!binaryPath) return null;
+
+  const oauth2Path = findGeminiOauth2FilePath(binaryPath);
+  if (!oauth2Path) return null;
+
+  try {
+    const content = fs.readFileSync(oauth2Path, "utf-8");
+    const clientIdMatch = content.match(/OAUTH_CLIENT_ID\s*=\s*["']([^"']+)["']/);
+    const clientSecretMatch = content.match(/OAUTH_CLIENT_SECRET\s*=\s*["']([^"']+)["']/);
+    if (!clientIdMatch || !clientSecretMatch) return null;
+    return {
+      clientId: clientIdMatch[1],
+      clientSecret: clientSecretMatch[1],
+    };
   } catch {
     return null;
   }
 }
 
-function maskToken(token?: string): string {
-  if (!token) return "missing";
-  if (token.length <= 8) return "present";
-  return `${token.slice(0, 4)}...${token.slice(-4)}`;
+function decodeJwtPayload(token: string): Record<string, unknown> | null {
+  try {
+    const parts = token.split(".");
+    if (parts.length !== 3) return null;
+    let base64 = parts[1].replace(/-/g, "+").replace(/_/g, "/");
+    const padding = base64.length % 4;
+    if (padding) base64 += "=".repeat(4 - padding);
+    return JSON.parse(Buffer.from(base64, "base64").toString("utf-8")) as Record<string, unknown>;
+  } catch {
+    return null;
+  }
 }
 
-async function collectChatSessionFiles(dir: string): Promise<string[]> {
-  const found: string[] = [];
+function formatResetTime(isoTime: string): string {
+  const resetDate = new Date(isoTime);
+  const diffMs = resetDate.getTime() - Date.now();
+  if (!Number.isFinite(diffMs)) return "unknown";
+  if (diffMs <= 0) return "now";
+  const mins = Math.floor(diffMs / 60000);
+  if (mins < 60) return `${mins}m`;
+  const hours = Math.floor(mins / 60);
+  const remMins = mins % 60;
+  return remMins > 0 ? `${hours}h ${remMins}m` : `${hours}h`;
+}
 
-  async function walk(current: string): Promise<void> {
-    let entries;
-    try {
-      entries = await readdir(current, { withFileTypes: true });
-    } catch {
-      return;
-    }
+function bar(percent: number, width = 22): string {
+  const clamped = Math.max(0, Math.min(100, percent));
+  const full = Math.round((clamped / 100) * width);
+  return `[${"█".repeat(full)}${"·".repeat(width - full)}]`;
+}
 
-    await Promise.all(
-      entries.map(async (entry) => {
-        const fullPath = path.join(current, entry.name);
-        if (entry.isDirectory()) {
-          await walk(fullPath);
-          return;
-        }
+async function refreshAccessToken(
+  creds: GeminiOAuthCreds,
+): Promise<{ accessToken: string; expiryDate: number } | null> {
+  if (!creds.refresh_token) return null;
+  const clientCreds = resolveGeminiOAuthClientCredentials();
+  if (!clientCreds) return null;
 
-        if (
-          entry.isFile() &&
-          fullPath.includes(`${path.sep}chats${path.sep}`) &&
-          entry.name.endsWith(".json")
-        ) {
-          found.push(fullPath);
-        }
-      }),
+  try {
+    const body = new URLSearchParams({
+      client_id: clientCreds.clientId,
+      client_secret: clientCreds.clientSecret,
+      refresh_token: creds.refresh_token,
+      grant_type: "refresh_token",
+    });
+
+    const response = await fetchWithTimeout(
+      TOKEN_REFRESH_API,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: body.toString(),
+      },
+      15000,
     );
-  }
 
-  await walk(dir);
-  return found;
+    if (!response.ok) return null;
+
+    const data = (await response.json()) as { access_token: string; expires_in: number };
+    return {
+      accessToken: data.access_token,
+      expiryDate: Date.now() + data.expires_in * 1000,
+    };
+  } catch {
+    return null;
+  }
 }
 
-async function collectGeminiSessionTelemetry(): Promise<{
-  sessionCount: number;
-  recentModels: string[];
-  lastUpdated: string | null;
-}> {
-  const files = await collectChatSessionFiles(geminiTmpPath());
-  if (files.length === 0) {
-    return { sessionCount: 0, recentModels: [], lastUpdated: null };
+async function fetchTierAndProjectId(
+  accessToken: string,
+): Promise<{ tier: "Paid" | "Workspace" | "Free" | "Legacy" | "Unknown"; projectId?: string }> {
+  try {
+    const response = await fetchWithTimeout(
+      LOAD_CODE_ASSIST_API,
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ metadata: { ideType: "GEMINI_CLI", pluginType: "GEMINI" } }),
+      },
+      15000,
+    );
+
+    if (!response.ok) return { tier: "Unknown" };
+
+    const data = (await response.json()) as Record<string, unknown>;
+    const tierStr = ((data.currentTier as { id?: string } | undefined)?.id ?? "").toLowerCase();
+    const projectId = typeof data.cloudaicompanionProject === "string" ? data.cloudaicompanionProject : undefined;
+
+    if (tierStr === "standard-tier" || tierStr === "g1-pro-tier") return { tier: "Paid", projectId };
+    if (tierStr === "free-tier") return { tier: "Free", projectId };
+    if (tierStr === "legacy-tier") return { tier: "Legacy", projectId };
+    return { tier: "Unknown", projectId };
+  } catch {
+    return { tier: "Unknown" };
+  }
+}
+
+async function fetchProjectId(accessToken: string): Promise<string | null> {
+  try {
+    const response = await fetchWithTimeout(
+      PROJECTS_API,
+      {
+        method: "GET",
+        headers: { Authorization: `Bearer ${accessToken}` },
+      },
+      15000,
+    );
+    if (!response.ok) return null;
+
+    const data = (await response.json()) as {
+      projects?: Array<{ projectId: string; labels?: Record<string, string> }>;
+    };
+    for (const project of data.projects ?? []) {
+      if (project.projectId.startsWith("gen-lang-client")) return project.projectId;
+      if (project.labels?.["generative-language"]) return project.projectId;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+function parseHighestQuotaModels(data: RetrieveUserQuotaResponse): {
+  proModel: GeminiModelQuota | null;
+  flashModel: GeminiModelQuota | null;
+} {
+  const buckets = data.buckets ?? [];
+
+  function version(modelId: string): number {
+    const match = modelId.match(/gemini-(\d+(?:\.\d+)?)/i);
+    return match ? Number.parseFloat(match[1]) : 0;
   }
 
-  const models = new Set<string>();
-  let latestTs = 0;
+  let proModel: GeminiModelQuota | null = null;
+  let proVersion = 0;
+  let flashModel: GeminiModelQuota | null = null;
+  let flashVersion = 0;
 
-  for (const filePath of files) {
-    const session = await readJsonIfExists<GeminiChatSession>(filePath);
-    if (!session) continue;
+  for (const bucket of buckets) {
+    const modelId = bucket.modelId ?? "";
+    const lower = modelId.toLowerCase();
+    const v = version(modelId);
+    const quota: GeminiModelQuota = {
+      modelId,
+      percentLeft: Math.max(0, Math.min(100, Math.round((bucket.remainingFraction ?? 0) * 100))),
+      resetsIn: formatResetTime(bucket.resetTime),
+    };
 
-    const lastUpdated = session.lastUpdated ? Date.parse(session.lastUpdated) : Number.NaN;
-    if (Number.isFinite(lastUpdated)) {
-      latestTs = Math.max(latestTs, lastUpdated);
-    }
-
-    for (const message of session.messages ?? []) {
-      if (message.model) {
-        models.add(message.model);
+    if (lower.includes("pro") && !lower.includes("flash")) {
+      if (v > proVersion) {
+        proModel = quota;
+        proVersion = v;
+      }
+    } else if (lower.includes("flash")) {
+      if (v > flashVersion) {
+        flashModel = quota;
+        flashVersion = v;
       }
     }
   }
 
-  return {
-    sessionCount: files.length,
-    recentModels: Array.from(models).slice(0, 8),
-    lastUpdated: latestTs > 0 ? formatEpochMs(latestTs) : null,
-  };
+  return { proModel, flashModel };
 }
 
-function formatResetTimeShort(isoTime: string): string {
-  if (!isoTime) return "-";
-
-  const resetDate = new Date(isoTime);
-  const now = new Date();
-  const diffMs = resetDate.getTime() - now.getTime();
-
-  if (!Number.isFinite(diffMs)) return "-";
-  if (diffMs <= 0) return "reset";
-
-  const diffMinutes = Math.floor(diffMs / 60000);
-  const days = Math.floor(diffMinutes / 1440);
-  const hours = Math.floor((diffMinutes % 1440) / 60);
-  const minutes = diffMinutes % 60;
-
-  if (days > 0) return `${days}d ${hours}h`;
-  return `${hours}h ${minutes}m`;
-}
-
-function formatEpochMs(epochMs: number): string {
-  const date = new Date(epochMs);
-  if (!Number.isFinite(date.getTime())) return "unknown";
-  return date.toISOString().replace("T", " ").slice(0, 19) + "Z";
-}
-
-function createProgressBar(percent: number, width = 20): string {
-  const clamped = Math.max(0, Math.min(100, percent));
-  const full = Math.round((clamped / 100) * width);
-  return `[${"#".repeat(full)}${".".repeat(width - full)}]`;
-}
-
-function safeMax(values: number[]): number {
-  if (values.length === 0) return 0;
-  return values.reduce((max, v) => (v > max ? v : max), values[0] ?? 0);
-}
-
-function extractModelQuotas(data: GoogleQuotaResponse): ModelQuota[] {
-  const quotas: ModelQuota[] = [];
-
-  for (const modelConfig of MODELS_TO_DISPLAY) {
-    let modelInfo = data.models[modelConfig.key];
-
-    if (!modelInfo && modelConfig.altKey) {
-      modelInfo = data.models[modelConfig.altKey];
-    }
-
-    if (modelInfo) {
-      const remainingFraction = modelInfo.quotaInfo?.remainingFraction ?? 0;
-      quotas.push({
-        displayName: modelConfig.display,
-        remainPercent: Math.round(remainingFraction * 100),
-        resetTimeDisplay: formatResetTimeShort(modelInfo.quotaInfo?.resetTime ?? ""),
-      });
-    }
-  }
-
-  return quotas;
-}
-
-async function refreshAccessToken(
-  refreshToken: string,
-): Promise<{ access_token: string; expires_in: number }> {
-  const params = new URLSearchParams({
-    client_id: GOOGLE_CLIENT_ID,
-    client_secret: GOOGLE_CLIENT_SECRET,
-    refresh_token: refreshToken,
-    grant_type: "refresh_token",
-  });
-
-  const response = await fetchWithTimeout(
-    GOOGLE_TOKEN_REFRESH_URL,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: params,
-    },
-    12000,
-  );
-
-  if (!response.ok) {
-    const errorText = await response.text();
-    throw new Error(`Google token refresh error ${response.status}: ${errorText.slice(0, 240)}`);
-  }
-
-  return (await response.json()) as { access_token: string; expires_in: number };
-}
-
-async function fetchGoogleUsage(
+async function fetchQuota(
   accessToken: string,
-  projectId: string,
-): Promise<GoogleQuotaResponse> {
-  const response = await fetchWithTimeout(GOOGLE_QUOTA_API_URL, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${accessToken}`,
-      "User-Agent": USER_AGENT,
-    },
-    body: JSON.stringify({ project: projectId }),
-  });
-
-  if (!response.ok) {
-    const errorText = await response.text();
-    throw new Error(`Google quota API error ${response.status}: ${errorText.slice(0, 240)}`);
-  }
-
-  return (await response.json()) as GoogleQuotaResponse;
-}
-
-function formatLocalDetails(
-  email: string,
-  oauth: GeminiOauthCreds | null,
-  accounts: GeminiAccounts | null,
-  installationId: string | null,
-  settings: GeminiSettings | null,
-  state: GeminiState | null,
-  trustedFolders: unknown,
-  projectId: string | null,
-  telemetry: { sessionCount: number; recentModels: string[]; lastUpdated: string | null },
-): string {
-  const lines: string[] = [];
-  lines.push(`### ${email}`);
-  lines.push("");
-  lines.push(`Mode         Local .gemini details`);
-  lines.push(`Project      ${projectId ?? "not set"}`);
-  lines.push(`InstallId    ${installationId ?? "missing"}`);
-  lines.push(`AccessToken  ${maskToken(oauth?.access_token)}`);
-  lines.push(`RefreshToken ${maskToken(oauth?.refresh_token)}`);
-
-  if (typeof oauth?.expiry_date === "number") {
-    const expired = oauth.expiry_date <= Date.now();
-    lines.push(`Expiry       ${formatEpochMs(oauth.expiry_date)} (${expired ? "expired" : "valid"})`);
-  } else {
-    lines.push(`Expiry       unknown`);
-  }
-
-  lines.push(`ActiveUser   ${accounts?.active ?? "unknown"}`);
-  lines.push(`OldUsers     ${Array.isArray(accounts?.old) ? accounts!.old!.length : 0}`);
-  lines.push(`MCP Servers  ${settings?.mcpServers ? Object.keys(settings.mcpServers).length : 0}`);
-  lines.push(`TipsShown    ${typeof state?.tipsShown === "number" ? state.tipsShown : "unknown"}`);
-  lines.push(`TrustFolders ${Array.isArray(trustedFolders) ? trustedFolders.length : 0}`);
-  lines.push(`Sessions     ${telemetry.sessionCount}`);
-  lines.push(`LastSession  ${telemetry.lastUpdated ?? "unknown"}`);
-  lines.push(`Models       ${telemetry.recentModels.length ? telemetry.recentModels.join(", ") : "none"}`);
-
-  return lines.join("\n");
-}
-
-function formatQuotaSection(models: ModelQuota[]): string {
-  const lines: string[] = [];
-  lines.push("Quota        API response");
-
-  if (models.length === 0) {
-    lines.push("No quota data.");
-    return lines.join("\n");
-  }
-
-  lines.push("");
-  for (const model of models) {
-    lines.push(
-      `${model.displayName.padEnd(10)} ${model.resetTimeDisplay.padEnd(10)} ${createProgressBar(model.remainPercent, 20)} ${model.remainPercent}%`,
+  projectId?: string,
+): Promise<{ proModel: GeminiModelQuota | null; flashModel: GeminiModelQuota | null }> {
+  try {
+    const body = projectId ? { project: projectId } : {};
+    const response = await fetchWithTimeout(
+      QUOTA_API,
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(body),
+      },
+      15000,
     );
+    if (!response.ok) return { proModel: null, flashModel: null };
+    const data = (await response.json()) as RetrieveUserQuotaResponse;
+    return parseHighestQuotaModels(data);
+  } catch {
+    return { proModel: null, flashModel: null };
+  }
+}
+
+function formatOutput(input: {
+  email: string;
+  tier: "Paid" | "Workspace" | "Free" | "Legacy" | "Unknown";
+  projectId: string | null;
+  proModel: GeminiModelQuota | null;
+  flashModel: GeminiModelQuota | null;
+}): string {
+  const lines: string[] = [];
+  lines.push(`Account      ${input.email}`);
+  lines.push(`Tier         ${input.tier}`);
+  lines.push(`Project      ${input.projectId ?? "unknown"}`);
+  lines.push("");
+
+  if (input.proModel) {
+    lines.push(
+      `Pro          ${bar(input.proModel.percentLeft)} ${input.proModel.percentLeft}% remaining (${input.proModel.resetsIn})`,
+    );
+    lines.push(`ProModel     ${input.proModel.modelId}`);
+  } else {
+    lines.push("Pro          unavailable");
   }
 
-  const maxUsage = safeMax(models.map((m) => 100 - m.remainPercent));
-  if (maxUsage >= HIGH_USAGE_THRESHOLD) {
-    lines.push("");
-    lines.push("High usage warning.");
+  if (input.flashModel) {
+    lines.push(
+      `Flash        ${bar(input.flashModel.percentLeft)} ${input.flashModel.percentLeft}% remaining (${input.flashModel.resetsIn})`,
+    );
+    lines.push(`FlashModel   ${input.flashModel.modelId}`);
+  } else {
+    lines.push("Flash        unavailable");
   }
 
   return lines.join("\n");
@@ -394,67 +397,57 @@ function formatQuotaSection(models: ModelQuota[]): string {
 
 async function queryGeminiUsage(): Promise<QueryResult> {
   try {
-    const [oauth, accounts, installationId, settings, state, trustedFolders] = await Promise.all([
-      readJsonIfExists<GeminiOauthCreds>(geminiOauthPath()),
-      readJsonIfExists<GeminiAccounts>(geminiAccountsPath()),
-      readTextIfExists(geminiInstallationIdPath()),
-      readJsonIfExists<GeminiSettings>(geminiSettingsPath()),
-      readJsonIfExists<GeminiState>(geminiStatePath()),
-      readJsonIfExists<unknown>(geminiTrustedFoldersPath()),
-    ]);
-    const telemetry = await collectGeminiSessionTelemetry();
-
-    const projectId = resolveProjectId();
-    const email = accounts?.active ?? "unknown";
-
-    const sections: string[] = [];
-    sections.push(
-      formatLocalDetails(
-        email,
-        oauth,
-        accounts,
-        installationId,
-        settings,
-        state,
-        trustedFolders,
-        projectId,
-        telemetry,
-      ),
-    );
-
-    if (projectId && oauth) {
-      try {
-        const expired = typeof oauth.expiry_date === "number" && oauth.expiry_date <= Date.now();
-        let accessToken = oauth.access_token?.trim() ?? "";
-
-        if ((!accessToken || expired) && oauth.refresh_token) {
-          const refreshed = await refreshAccessToken(oauth.refresh_token);
-          accessToken = refreshed.access_token;
-        }
-
-        if (accessToken) {
-          const data = await fetchGoogleUsage(accessToken, projectId);
-          const models = extractModelQuotas(data);
-          sections.push("");
-          sections.push(formatQuotaSection(models));
-        } else {
-          sections.push("");
-          sections.push("Quota        skipped (no usable access token)");
-        }
-      } catch (error) {
-        sections.push("");
-        sections.push(
-          `Quota        unavailable (${error instanceof Error ? error.message : String(error)})`,
-        );
-      }
-    } else {
-      sections.push("");
-      sections.push("Quota        skipped (project id not set)");
+    const settings = readJsonFile<GeminiSettings>(SETTINGS_PATH);
+    const authType = resolveGeminiAuthType(settings);
+    if (authType === "api-key" || authType === "vertex-ai") {
+      return {
+        success: true,
+        output: `Quota        skipped (unsupported auth type: ${authType}; use OAuth)`,
+      };
     }
+
+    const creds = readJsonFile<GeminiOAuthCreds>(OAUTH_CREDS_PATH);
+    if (!creds?.access_token) {
+      return {
+        success: true,
+        output: "Quota        skipped (Gemini OAuth not configured, run `gemini`)",
+      };
+    }
+
+    let accessToken = creds.access_token;
+    const expired = typeof creds.expiry_date === "number" && creds.expiry_date < Date.now();
+    if (expired) {
+      const refreshed = await refreshAccessToken(creds);
+      if (!refreshed) {
+        return {
+          success: true,
+          output: "Quota        unavailable (OAuth token expired and refresh failed)",
+        };
+      }
+      accessToken = refreshed.accessToken;
+      writeJsonFile(OAUTH_CREDS_PATH, {
+        ...creds,
+        access_token: refreshed.accessToken,
+        expiry_date: refreshed.expiryDate,
+      });
+    }
+
+    const payload = creds.id_token ? decodeJwtPayload(creds.id_token) : null;
+    const email = (typeof payload?.email === "string" ? payload.email : null) ?? "unknown";
+
+    const tierInfo = await fetchTierAndProjectId(accessToken);
+    const projectId = tierInfo.projectId ?? (await fetchProjectId(accessToken));
+    const { proModel, flashModel } = await fetchQuota(accessToken, projectId ?? undefined);
 
     return {
       success: true,
-      output: sections.join("\n"),
+      output: formatOutput({
+        email,
+        tier: tierInfo.tier,
+        projectId,
+        proModel,
+        flashModel,
+      }),
     };
   } catch (error) {
     return {
@@ -469,3 +462,4 @@ export const geminiProvider: Provider = {
   label: "Gemini",
   query: queryGeminiUsage,
 };
+
