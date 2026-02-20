@@ -46,6 +46,42 @@ bun link
 agent-status
 ```
 
+## Installation scripts
+
+Linux/macOS (`sh`):
+
+```bash
+sh ./scripts/install.sh
+```
+
+Linux/macOS clone + install:
+
+```bash
+sh ./scripts/install.sh https://github.com/SpreadSheets600/Agent-Quota.git agent-status
+```
+
+Windows (`cmd`):
+
+```bat
+scripts\\install.cmd
+```
+
+Windows clone + install:
+
+```bat
+scripts\\install.cmd https://github.com/SpreadSheets600/Agent-Quota.git agent-status
+```
+
+You can also run via package scripts:
+
+```bash
+bun run install:sh
+```
+
+```bat
+bun run install:cmd
+```
+
 ## Build standalone binary
 
 ```bash

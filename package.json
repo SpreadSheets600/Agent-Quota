@@ -12,6 +12,8 @@
     "start": "bun run src/index.ts",
     "typecheck": "bunx tsc --noEmit",
     "build": "bun build src/index.ts --compile --outfile dist/agent-status",
+    "install:sh": "sh ./scripts/install.sh",
+    "install:cmd": "cmd /c .\\scripts\\install.cmd",
     "ci": "bun run typecheck && bun run build",
     "publish:npm": "npm publish --access public --provenance"
   },
