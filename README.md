@@ -13,6 +13,10 @@ Current providers:
 - z.ai via env/auth token
 - Antigravity via local language server process probe
 
+## Screenshots
+
+![image](.github/image-1.png)
+
 ## Features
 
 - OpenTUI React interface with minimal split layout
